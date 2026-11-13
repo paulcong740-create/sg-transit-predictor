@@ -1,0 +1,50 @@
+# .github/workflows/collect.yml
+# Tells GitHub to run collect.py in the cloud every 5 minutes and save the new data back to the repository.
+
+name: Collect transit data
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay runs a little when busy)
+  workflow_dispatch:         # adds a "Run workflow" button so you can test it by hand
+
+permissions:
+  contents: write            # allows the workflow to save the CSV files back to the repo
+
+concurrency:
+  group: collect             # never run two collectors at the same time
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libraries
+        run: pip install requests python-dotenv
+
+      - name: Collect one round of data
+        env:
+          LTA_API_KEY: ${{ secrets.LTA_API_KEY }}   # read from GitHub Secrets, never written in the code
+        run: python collect.py --once
+
+      - name: Save the data back to GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bus_data.csv mrt_data.csv
+          if git diff --cached --quiet; then
+            echo "No new data"
+            exit 0
+          fi
+          git commit -m "Collect data $(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M')"
+          git pull --rebase
+          git push
