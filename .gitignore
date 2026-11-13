@@ -1,3 +1,5 @@
-   .env
-   __pycache__/
-   
+# Never upload the API key
+.env
+
+# Python cache files
+__pycache__/
