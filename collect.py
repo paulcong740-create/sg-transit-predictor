@@ -1,11 +1,14 @@
 # collect.py
-# Step 2: collects bus arrival + MRT crowd data every few minutes and saves it to CSV files.
-# Leave it running. Press Ctrl + C to stop. Run it again any time; it adds to the same files.
+# Collects bus arrival + MRT crowd data and saves it to CSV files.
+#
+#   python collect.py         -> runs forever on your laptop, every few minutes (Ctrl + C to stop)
+#   python collect.py --once  -> collects one round and exits (used by GitHub Actions in the cloud)
 
 import csv
 import os
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -80,14 +83,24 @@ def collect_mrt(now):
     return len(rows)
 
 
-print("Collector started. Press Ctrl + C to stop.")
-while True:
-    now = datetime.now().astimezone()
-    try:
-        b = collect_buses(now)
-        m = collect_mrt(now)
-        print(f"{now:%H:%M:%S}  saved {b} bus rows, {m} MRT rows")
-    except Exception as e:
-        # don't crash on a bad network moment; just try again next round
-        print(f"{now:%H:%M:%S}  error: {e} (will retry)")
-    time.sleep(INTERVAL_MINUTES * 60)
+SINGAPORE_TIME = timezone(timedelta(hours=8))  # GitHub's servers use UTC, so always record Singapore time
+
+
+def collect_once():
+    now = datetime.now(SINGAPORE_TIME)
+    b = collect_buses(now)
+    m = collect_mrt(now)
+    print(f"{now:%Y-%m-%d %H:%M:%S}  saved {b} bus rows, {m} MRT rows")
+
+
+if "--once" in sys.argv:
+    collect_once()   # cloud mode: one round, then exit (an error makes the GitHub run show as failed)
+else:
+    print("Collector started. Press Ctrl + C to stop.")
+    while True:
+        try:
+            collect_once()
+        except Exception as e:
+            # don't crash on a bad network moment; just try again next round
+            print(f"error: {e} (will retry)")
+        time.sleep(INTERVAL_MINUTES * 60)
