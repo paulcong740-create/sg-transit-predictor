@@ -42,7 +42,10 @@ def download(kind, month=None):
 
     os.makedirs("data/volume", exist_ok=True)
     out = f"data/volume/{kind}_{label}.csv.gz"
-    with gzip.open(out, "wb") as f:
+    if os.path.exists(out):
+        print(f"Already have {out} - nothing new from LTA yet")
+        return
+    with open(out, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:
         f.write(data)
     rows = data.count(b"\n") - 1
     print(f"Saved {out}  ({rows:,} rows)")
