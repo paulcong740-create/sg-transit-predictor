@@ -1,0 +1,4 @@
+# The daily data files only ever get new rows added at the end.
+# If two saves happen at the same moment, keep the rows from both instead of stopping with a conflict.
+data/bus/*.csv merge=union
+data/mrt/*.csv merge=union

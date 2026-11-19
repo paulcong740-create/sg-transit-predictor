@@ -60,6 +60,10 @@ BUS_STOPS = {**MY_STOPS, **INTERCHANGES}
 TRAIN_LINES = ["NSL", "EWL", "CGL", "NEL", "CCL", "CEL", "DTL", "TEL", "BPL", "SLRT", "PLRT"]
 
 INTERVAL_MINUTES = 3           # laptop mode only
+
+# LTA only refreshes MRT crowd levels every 10 minutes, and limits how many crowd requests one key
+# can make per hour. Asking every 5 minutes used up the limit by :50 each hour, so we ask every 10.
+MRT_EVERY_MINUTES = 10
 # --------------------------
 
 BUS_HEADER = ["time", "bus_stop", "service", "wait_minutes", "load", "bus_type", "monitored"]
@@ -111,6 +115,18 @@ def collect_buses(now):
     return len(rows), failed
 
 
+def minutes_since_last_mrt(now):
+    """How long ago the last MRT round was saved (None if there's nothing saved today)."""
+    filename = os.path.join("data/mrt", f"{now:%Y-%m-%d}.csv")
+    try:
+        with open(filename) as f:
+            last_line = f.readlines()[-1]
+        last_time = datetime.fromisoformat(last_line.split(",")[0])
+        return (now - last_time).total_seconds() / 60
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def collect_mrt(now):
     rows, failed = [], []
     for line in TRAIN_LINES:
@@ -130,12 +146,23 @@ def collect_mrt(now):
 def collect_once():
     now = datetime.now(SINGAPORE_TIME)
     b, bus_failed = collect_buses(now)
-    m, mrt_failed = collect_mrt(now)
-    print(f"{now:%Y-%m-%d %H:%M:%S}  saved {b} bus rows, {m} MRT rows")
+
+    since = minutes_since_last_mrt(now)
+    mrt_due = since is None or since >= MRT_EVERY_MINUTES - 2      # -2 allows for runs starting a bit late
+    if mrt_due:
+        m, mrt_failed = collect_mrt(now)
+        print(f"{now:%Y-%m-%d %H:%M:%S}  saved {b} bus rows, {m} MRT rows")
+    else:
+        m, mrt_failed = 0, []
+        print(f"{now:%Y-%m-%d %H:%M:%S}  saved {b} bus rows (MRT skipped, last collected {since:.0f} min ago)")
+
     if bus_failed or mrt_failed:
         print("  could not reach:", bus_failed + mrt_failed)
-    if b == 0 and m == 0:
-        raise RuntimeError("Nothing collected - check the API key")   # makes the GitHub run show red
+    # Only show a red failure when LTA refused every single request (e.g. the API key stopped working).
+    # Zero rows on its own is normal late at night, when no buses are running.
+    asked = len(BUS_STOPS) + (len(TRAIN_LINES) if mrt_due else 0)
+    if len(bus_failed) + len(mrt_failed) == asked:
+        raise RuntimeError("LTA refused every request - check the API key")
 
 
 if __name__ == "__main__":
