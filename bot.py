@@ -348,6 +348,13 @@ async def go_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not place:
         return ASK_TO
     start = context.user_data["start"]
+    # same place (or within ~300 m)? no need for public transport
+    if abs(start["lat"] - place["lat"]) < 0.003 and abs(start["lon"] - place["lon"]) < 0.003:
+        await update.message.reply_text(
+            f"📍 <b>{escape(place['name'])}</b> is where you're starting from, or right next to it, "
+            "so there's no trip to plan. 🙂\n\n🏁 <b>Where do you want to go?</b> (or /cancel)",
+            parse_mode="HTML")
+        return ASK_TO
     await update.message.reply_text(f"✅ To: <b>{escape(place['name'])}</b>\n🔎 Finding the best route…",
                                     parse_mode="HTML")
     try:
@@ -381,7 +388,7 @@ async def show_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def go_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled. Send /go to plan another trip.")
+    await update.message.reply_text("Trip planning cancelled. Send /go to plan another trip, or /help for all commands.")
     return ConversationHandler.END
 
 
@@ -453,7 +460,7 @@ def main():
             ASK_FROM: [MessageHandler(place_input, go_from)],
             ASK_TO: [MessageHandler(place_input, go_to)],
         },
-        fallbacks=[CommandHandler("cancel", go_cancel)],
+        fallbacks=[MessageHandler(filters.COMMAND, go_cancel)],   # /cancel or any other command stops the trip
     ))
     app.add_handler(CallbackQueryHandler(show_option, pattern=r"^opt:\d+$"))
     app.add_handler(CommandHandler(["start", "help"], start))

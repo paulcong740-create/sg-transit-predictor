@@ -1,0 +1,7 @@
+requests
+python-dotenv
+python-telegram-bot
+pandas
+matplotlib
+scikit-learn
+joblib
