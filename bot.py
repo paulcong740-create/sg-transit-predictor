@@ -17,6 +17,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           ConversationHandler, MessageHandler, filters)
 
 import onemap
+import predictor
 
 load_dotenv()
 LTA_API_KEY = os.getenv("LTA_API_KEY")
@@ -99,10 +100,15 @@ def mrt_text(stations):
         for row in lta_get("PCDRealTime", {"TrainLine": line})["value"]:
             levels[row["Station"]] = row["CrowdLevel"]
 
-    lines = ["🚇 <b>Platform crowd</b>"]
+    in_30 = datetime.now(SG) + timedelta(minutes=30)
+    lines = ["🚇 <b>Platform crowd</b>  <i>(now · 🔮 in 30 min)</i>"]
     for code in stations:
         level = CROWD.get(levels.get(code), "⚪ No data")
-        lines.append(f"{STATION_NAMES.get(code, code)}: {level}")
+        line = f"{STATION_NAMES.get(code, code)}: {level}"
+        forecast = predictor.predict(code, in_30)
+        if forecast:
+            line += f"  ·  🔮 {predictor.LEVEL_TEXT[forecast[0]].split(' ')[1]}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -215,7 +221,12 @@ def trip_text(start, end, itineraries, index=0):
     crowd_cache = {}
     legs = best.get("legs", [])
     step = 1
+    now = datetime.now(SG)
+    elapsed = 0.0                 # minutes from now until this leg starts
+    mrt_stops = []                # (station code, minutes from now) for the "leave later?" check
     for i, leg in enumerate(legs):
+        leg_starts_at = now + timedelta(minutes=elapsed)
+        elapsed += leg.get("duration", 0) / 60
         mode = leg.get("mode")
         frm, to = leg.get("from", {}), leg.get("to", {})
         mins = max(1, round(leg.get("duration", 0) / 60))
@@ -252,9 +263,23 @@ def trip_text(start, end, itineraries, index=0):
                     lines.append(f"     <i>Platform crowd now: {crowd_at(code, crowd_cache)}</i>")
                 except Exception:
                     pass
+                forecast = predictor.describe(code, leg_starts_at)
+                if forecast:
+                    lines.append(f"     <i>🔮 When you get there (~{leg_starts_at:%H:%M}): usually {forecast}</i>")
+                    mrt_stops.append((code, (leg_starts_at - now).total_seconds() / 60))
         else:
             lines.append(f"{step}. {escape(str(mode).title())} to {escape(onemap.nice_name(to.get('name', '')))} ({mins} min)")
         step += 1
+
+    try:
+        wait = predictor.best_departure(mrt_stops)
+    except Exception as e:
+        print("Prediction error:", e)
+        wait = None
+    if wait:
+        leave_at = now + timedelta(minutes=wait)
+        lines.append(f"\n💡 <b>Tip:</b> the trains are usually busy right now. "
+                     f"Leaving at about <b>{leave_at:%H:%M}</b> ({wait} min later) should be quieter.")
 
     others = [i for i in range(len(itineraries)) if i != index]
     if others:
@@ -267,7 +292,7 @@ def trip_text(start, end, itineraries, index=0):
         lines.append("\n" + alert_text())
     except Exception:
         pass
-    lines.append("\n<i>🟢 seats  🟡 standing  🔴 packed  ·  Routes by OneMap</i>")
+    lines.append("\n<i>🟢 seats  🟡 standing  🔴 packed  ·  🔮 = prediction from my model  ·  Routes by OneMap</i>")
     return "\n".join(lines)
 
 
