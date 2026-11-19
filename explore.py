@@ -32,7 +32,7 @@ def load(kind):
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert("Asia/Singapore")
     df["hour"] = df["time"].dt.hour
-    df["weekday"] = df["time"].dt.dayofweek < 5          # Mon-Fri = True, Sat-Sun = False
+    df["weekday"] = df["time"].dt.day_of_week < 5          # Mon-Fri = True, Sat-Sun = False
     print(f"{kind}: {len(df):,} rows from {len(files)} days "
           f"({df['time'].min():%d %b %H:%M} to {df['time'].max():%d %b %H:%M})")
     return df
