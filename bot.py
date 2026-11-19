@@ -1,8 +1,8 @@
 # bot.py
-# Telegram bot that shows live bus arrivals, MRT crowd levels and train alerts for my commute.
+# Telegram bot: plans trips anywhere in Singapore, with live bus times, MRT crowd levels
+# and crowd predictions from my own model.
 #
 # Run it with:  python bot.py      (stop with Ctrl + C)
-# The bot only answers while this is running.
 
 import asyncio
 import os
@@ -12,7 +12,8 @@ from html import escape
 
 import requests
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                      ReplyKeyboardMarkup, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 
@@ -27,23 +28,24 @@ BASE = "https://datamall2.mytransport.sg/ltaodataservice"
 SG = timezone(timedelta(hours=8))
 
 # ---- MY ROUTE ----
-HOME_STOP = "44089"            # board here going to school
-HOME_STOP_BUSES = {"991", "451"}
-CCK_INT = "44009"              # Choa Chu Kang Int, board here going home
-CCK_INT_BUSES = {"172"}
-TO_SCHOOL_STATIONS = ["NS3", "NS1", "EW24", "EW22"]
-GO_HOME_STATIONS = ["EW22", "EW24", "NS1", "NS4"]
-STATION_NAMES = {
-    "NS3": "Bukit Gombak",
-    "NS1": "Jurong East (NSL)",
-    "EW24": "Jurong East (EWL)",
-    "EW22": "Dover",
-    "NS4": "Choa Chu Kang",
-}
+HOME_STOP, HOME_STOP_BUSES = "44089", {"991", "451"}      # board here going to school
+CCK_INT, CCK_INT_BUSES = "44009", {"172"}                 # Choa Chu Kang Int, going home
+TO_SCHOOL_STATIONS = ["NS3", "NS1", "EW22"]
+GO_HOME_STATIONS = ["EW22", "NS1", "NS4"]
+STATION_NAMES = {"NS3": "Bukit Gombak", "NS1": "Jurong East", "EW24": "Jurong East",
+                 "EW22": "Dover", "NS4": "Choa Chu Kang"}
 # ------------------
 
-BUS_LOAD = {"SEA": "🟢", "SDA": "🟡", "LSD": "🔴"}
-CROWD = {"l": "🟢 Low", "m": "🟡 Moderate", "h": "🔴 High"}
+DOT = {"l": "🟢", "m": "🟡", "h": "🔴"}                 # MRT crowd: low / moderate / high
+BUS_LOAD = {"SEA": "🟢", "SDA": "🟡", "LSD": "🔴"}       # bus: seats / standing / packed
+
+# ---- the buttons under the chat box ----
+BTN_SCHOOL, BTN_HOME, BTN_TRIP, BTN_MRT = "🎒 To school", "🏠 Go home", "🗺️ Plan a trip", "🚇 MRT crowds"
+BTN_CANCEL = "✖️ Cancel"
+MAIN_MENU = ReplyKeyboardMarkup([[BTN_SCHOOL, BTN_HOME], [BTN_TRIP, BTN_MRT]], resize_keyboard=True)
+ASK_MENU = ReplyKeyboardMarkup([[KeyboardButton("📍 Use my location", request_location=True)], [BTN_CANCEL]],
+                               resize_keyboard=True)
+MENU_BUTTONS = [BTN_SCHOOL, BTN_HOME, BTN_TRIP, BTN_MRT, BTN_CANCEL]
 
 
 # ---------- Getting data from LTA ----------
@@ -67,95 +69,97 @@ def service_sort_key(service_no):
     return (int(digits) if digits else 9999, service_no)
 
 
-# ---------- Building the reply messages ----------
+def bus_times(service):
+    """'4🟢 · 11🟡 · ~22🟢'  (~ = timetable estimate, not live GPS)"""
+    times = []
+    for key in ("NextBus", "NextBus2", "NextBus3"):
+        bus = service.get(key) or {}
+        mins = minutes_until(bus.get("EstimatedArrival"))
+        if mins is None:
+            continue
+        label = "now" if mins == 0 else str(mins)
+        if bus.get("Monitored") == 0:
+            label = "~" + label
+        times.append(label + BUS_LOAD.get(bus.get("Load"), ""))
+    return " · ".join(times)
 
-def bus_text(stop, only=None):
+
+def crowd_levels(lines):
+    """Live crowd level for every station on the given lines, e.g. {'NS1': 'm', ...}"""
+    levels = {}
+    for line in lines:
+        for row in lta_get("PCDRealTime", {"TrainLine": line})["value"]:
+            levels[row["Station"]] = row["CrowdLevel"]
+    return levels
+
+
+def disruption_text():
+    """Empty string when trains are running normally, so it doesn't take up space."""
+    try:
+        value = lta_get("TrainServiceAlerts").get("value", {})
+    except Exception:
+        return ""
+    if isinstance(value, list):
+        value = value[0] if value else {}
+    if str(value.get("Status")) != "2":
+        return ""
+    lines = ["\n⚠️ <b>Train disruption</b>"]
+    for seg in value.get("AffectedSegments", []):
+        lines.append(f"{seg.get('Line', '')}: {seg.get('Stations', '')}")
+    for msg in value.get("Message", [])[:1]:
+        lines.append(f"<i>{escape(msg.get('Content', ''))}</i>")
+    return "\n".join(lines)
+
+
+# ---------- My commute ----------
+
+def bus_block(stop, only=None):
     services = lta_get("v3/BusArrival", {"BusStopCode": stop})["Services"]
     if only:
         services = [s for s in services if s["ServiceNo"] in only]
-    if not services:
-        return f"🚌 <b>Bus stop {stop}</b>\nNo buses right now."
-
-    lines = [f"🚌 <b>Bus stop {stop}</b>"]
-    for s in sorted(services, key=lambda s: service_sort_key(s["ServiceNo"])):
-        times = []
-        for key in ("NextBus", "NextBus2", "NextBus3"):
-            bus = s.get(key) or {}
-            mins = minutes_until(bus.get("EstimatedArrival"))
-            if mins is None:
-                continue
-            label = "Arr" if mins == 0 else f"{mins}m"
-            if bus.get("Monitored") == 0:
-                label = "~" + label          # ~ = timetable estimate, not live GPS
-            times.append(f"{label} {BUS_LOAD.get(bus.get('Load'), '')}")
-        if times:
-            lines.append(f"<b>{s['ServiceNo']}</b>: " + "  ·  ".join(times))
+    lines = [f"🚌 <b>Bus stop {stop}</b>  <i>(min)</i>"]
+    rows = [(s["ServiceNo"], bus_times(s)) for s in sorted(services, key=lambda s: service_sort_key(s["ServiceNo"]))]
+    rows = [(no, t) for no, t in rows if t]
+    lines += [f"<b>{no}</b>   {t}" for no, t in rows] or ["No buses right now"]
     return "\n".join(lines)
 
 
-def mrt_text(stations):
-    wanted_lines = {"NSL" if code.startswith("NS") else "EWL" for code in stations}
-    levels = {}
-    for line in wanted_lines:
-        for row in lta_get("PCDRealTime", {"TrainLine": line})["value"]:
-            levels[row["Station"]] = row["CrowdLevel"]
-
+def mrt_block(stations):
+    levels = crowd_levels({"NSL" if c.startswith("NS") else "EWL" for c in stations})
     in_30 = datetime.now(SG) + timedelta(minutes=30)
-    lines = ["🚇 <b>Platform crowd</b>  <i>(now · 🔮 in 30 min)</i>"]
+    lines = ["🚇 <b>Platforms</b>  <i>now → 🔮 in 30 min</i>"]
     for code in stations:
-        level = CROWD.get(levels.get(code), "⚪ No data")
-        line = f"{STATION_NAMES.get(code, code)}: {level}"
+        now_dot = DOT.get(levels.get(code), "⚪")
         forecast = predictor.predict(code, in_30)
-        if forecast:
-            line += f"  ·  🔮 {predictor.LEVEL_TEXT[forecast[0]].split(' ')[1]}"
-        lines.append(line)
+        later = f" → {DOT[forecast[0]]}" if forecast else ""
+        lines.append(f"{now_dot}{later}  {STATION_NAMES.get(code, code)}")
     return "\n".join(lines)
 
 
-def alert_text():
-    value = lta_get("TrainServiceAlerts").get("value", {})
-    if isinstance(value, list):            # be safe if LTA wraps it in a list
-        value = value[0] if value else {}
-    if str(value.get("Status")) != "2":
-        return "✅ No train disruptions"
-
-    lines = ["⚠️ <b>Train disruption</b>"]
-    for seg in value.get("AffectedSegments", []):
-        lines.append(f"{seg.get('Line', '')} ({seg.get('Direction', '')}): {seg.get('Stations', '')}")
-    for msg in value.get("Message", []):
-        lines.append(msg.get("Content", ""))
-    return "\n".join(lines)
-
-
-LEGEND = "\n\n<i>🟢 seats  🟡 standing  🔴 packed  ·  ~ = timetable estimate</i>"
+def header(title):
+    return f"{title}  <i>{datetime.now(SG):%H:%M}</i>"
 
 
 def school_text():
-    return "\n\n".join([
-        "🎒 <b>Going to school</b>",
-        bus_text(HOME_STOP, HOME_STOP_BUSES),
-        mrt_text(TO_SCHOOL_STATIONS),
-        alert_text(),
-    ]) + LEGEND
+    return "\n\n".join([header("🎒 <b>To school</b>"), bus_block(HOME_STOP, HOME_STOP_BUSES),
+                        mrt_block(TO_SCHOOL_STATIONS)]) + disruption_text()
 
 
 def home_text():
-    return "\n\n".join([
-        "🏠 <b>Going home</b>",
-        mrt_text(GO_HOME_STATIONS),
-        bus_text(CCK_INT, CCK_INT_BUSES),
-        alert_text(),
-    ]) + LEGEND
+    return "\n\n".join([header("🏠 <b>Going home</b>"), mrt_block(GO_HOME_STATIONS),
+                        bus_block(CCK_INT, CCK_INT_BUSES)]) + disruption_text()
+
+
+def mrt_text():
+    return header("🚇 <b>MRT crowds</b>") + "\n\n" + mrt_block(["NS4", "NS3", "NS1", "EW22"]) + disruption_text()
 
 
 # ---------- Journey planner (any place to any place) ----------
 
 PCD_LINE = {"NS": "NSL", "EW": "EWL", "CG": "CGL", "NE": "NEL", "CC": "CCL", "CE": "CEL",
             "DT": "DTL", "TE": "TEL", "BP": "BPL", "SW": "SLRT", "SE": "SLRT", "PW": "PLRT", "PE": "PLRT"}
-LINE_NAME = {"NSL": "North-South Line", "EWL": "East-West Line", "CGL": "East-West Line",
-             "NEL": "North East Line", "CCL": "Circle Line", "CEL": "Circle Line",
-             "DTL": "Downtown Line", "TEL": "Thomson-East Coast Line", "BPL": "Bukit Panjang LRT",
-             "SLRT": "Sengkang LRT", "PLRT": "Punggol LRT"}
+LINE_LABEL = {"NSL": "NSL", "EWL": "EWL", "CGL": "EWL", "NEL": "NEL", "CCL": "CCL", "CEL": "CCL",
+              "DTL": "DTL", "TEL": "TEL", "BPL": "BP LRT", "SLRT": "Sengkang LRT", "PLRT": "Punggol LRT"}
 
 
 def station_code(leg_end):
@@ -167,109 +171,102 @@ def station_code(leg_end):
     return None
 
 
-def live_bus_times(stop, service):
-    data = lta_get("v3/BusArrival", {"BusStopCode": stop, "ServiceNo": service})
-    for s in data.get("Services", []):
-        times = []
-        for key in ("NextBus", "NextBus2", "NextBus3"):
-            bus = s.get(key) or {}
-            mins = minutes_until(bus.get("EstimatedArrival"))
-            if mins is None:
-                continue
-            label = "Arr" if mins == 0 else f"{mins}m"
-            if bus.get("Monitored") == 0:
-                label = "~" + label
-            times.append(f"{label} {BUS_LOAD.get(bus.get('Load'), '')}")
-        if times:
-            return "  ·  ".join(times)
-    return "no live times right now"
+def short_name(name):
+    """'BUKIT GOMBAK MRT STATION (NS3)' -> 'Bukit Gombak'"""
+    t = onemap.nice_name(name)
+    t = re.sub(r"\s*\([A-Z]{2}\d{1,2}\)", "", t)
+    t = re.sub(r"\s+(MRT|LRT)(\s+Station)?\b|\s+Stn\b", "", t, flags=re.IGNORECASE)
+    return escape(t.strip())
 
 
-def crowd_at(code, cache):
-    line = PCD_LINE.get(code[:2])
-    if line not in cache:
-        cache[line] = {row["Station"]: row["CrowdLevel"]
-                       for row in lta_get("PCDRealTime", {"TrainLine": line})["value"]}
-    return CROWD.get(cache[line].get(code), "⚪ No data")
+def line_of(leg):
+    code = station_code(leg.get("from", {}))
+    return LINE_LABEL.get(PCD_LINE.get(code[:2]), "MRT") if code else "MRT"
 
 
 def short_summary(itinerary):
     parts = []
     for leg in itinerary.get("legs", []):
         if leg.get("mode") == "BUS":
-            parts.append(f"Bus {leg.get('route', '')}")
+            parts.append(f"🚌{leg.get('route', '')}")
         elif leg.get("mode") in ("SUBWAY", "RAIL", "TRAM"):
-            code = station_code(leg.get("from", {}))
-            parts.append(PCD_LINE.get(code[:2], "MRT") if code else "MRT")
-    return " → ".join(parts) or "Walk"
+            parts.append(f"🚇{line_of(leg)}")
+    return " → ".join(parts) or "🚶 Walk"
 
 
 def trip_text(start, end, itineraries, index=0):
-    """Full step-by-step details (with live data) for one of the route options."""
-    best = itineraries[index]
-    total = round(best.get("duration", 0) / 60)
-    transfers = best.get("transfers", 0)
-    title = "Fastest route" if index == 0 else f"Option {index + 1}"
-    lines = [f"🗺️ <b>{escape(start['name'])} → {escape(end['name'])}</b>",
-             f"<b>{title}</b>",
-             f"⏱️ {total} min  ·  🔁 {transfers} transfer{'s' if transfers != 1 else ''}"]
-    fare = best.get("fare")
-    if fare not in (None, "", "0"):
-        lines[-1] += f"  ·  💲{fare}"
-    lines.append("")
+    """One route option, step by step, with live data and predictions."""
+    trip = itineraries[index]
+    total = round(trip.get("duration", 0) / 60)
+    transfers = trip.get("transfers", 0)
+    fare = trip.get("fare")
+    option = "" if index == 0 else f"  <i>(option {index + 1})</i>"
+    lines = [f"🗺️ <b>{short_name(start['name'])} → {short_name(end['name'])}</b>{option}",
+             f"⏱ <b>{total} min</b> · {transfers} transfer{'s' if transfers != 1 else ''}"
+             + (f" · ${fare}" if fare not in (None, "", "0") else ""),
+             ""]
 
-    crowd_cache = {}
-    legs = best.get("legs", [])
-    step = 1
     now = datetime.now(SG)
     elapsed = 0.0                 # minutes from now until this leg starts
-    mrt_stops = []                # (station code, minutes from now) for the "leave later?" check
-    for i, leg in enumerate(legs):
-        leg_starts_at = now + timedelta(minutes=elapsed)
-        elapsed += leg.get("duration", 0) / 60
+    walk = 0.0                    # walking minutes not shown yet (we merge walks together)
+    mrt_stops = []                # (station code, minutes from now), for the "leave later?" tip
+    crowd_cache = {}
+
+    def flush_walk():
+        nonlocal walk
+        if walk >= 1:
+            lines.append(f"🚶 {round(walk)} min walk")
+        walk = 0.0
+
+    for leg in trip.get("legs", []):
+        starts_at = now + timedelta(minutes=elapsed)
+        minutes = leg.get("duration", 0) / 60
+        elapsed += minutes
         mode = leg.get("mode")
         frm, to = leg.get("from", {}), leg.get("to", {})
-        mins = max(1, round(leg.get("duration", 0) / 60))
         stops = leg.get("numIntermediateStops")
         stops_txt = f" · {stops + 1} stops" if isinstance(stops, int) else ""
 
         if mode == "WALK":
-            dist = round(leg.get("distance", 0))
-            if dist < 50:
-                continue
-            target = "your destination" if i == len(legs) - 1 else escape(onemap.nice_name(to.get("name", "next stop")))
-            lines.append(f"{step}. 🚶 Walk {dist}m to {target} ({mins} min)")
+            walk += minutes
+            continue
+        flush_walk()
 
-        elif mode == "BUS":
-            service = str(leg.get("route", ""))
+        if mode == "BUS":
+            service = escape(str(leg.get("route", "")))
             stop_code = str(frm.get("stopCode", ""))
-            lines.append(f"{step}. 🚌 <b>Bus {escape(service)}</b> from {escape(onemap.nice_name(frm.get('name', '')))}"
-                         f" ({escape(stop_code)})")
-            lines.append(f"     → {escape(onemap.nice_name(to.get('name', '')))}{stops_txt} · {mins} min")
+            lines.append(f"🚌 <b>{service}</b>  {short_name(frm.get('name', ''))} → "
+                         f"{short_name(to.get('name', ''))}{stops_txt}")
             if stop_code.isdigit():
                 try:
-                    lines.append(f"     <i>Next bus: {live_bus_times(stop_code, service)}</i>")
+                    data = lta_get("v3/BusArrival", {"BusStopCode": stop_code, "ServiceNo": leg.get("route")})
+                    times = next((bus_times(s) for s in data.get("Services", []) if bus_times(s)), "")
+                    lines.append(f"      <i>next bus (min): {times}</i>" if times else "      <i>no live times</i>")
                 except Exception:
                     pass
 
         elif mode in ("SUBWAY", "RAIL", "TRAM"):
+            lines.append(f"🚇 <b>{line_of(leg)}</b>  {short_name(frm.get('name', ''))} → "
+                         f"{short_name(to.get('name', ''))}{stops_txt}")
             code = station_code(frm)
-            line = PCD_LINE.get(code[:2]) if code else None
-            name = LINE_NAME.get(line, "MRT")
-            lines.append(f"{step}. 🚇 <b>{name}</b> {escape(onemap.nice_name(frm.get('name', '')))}"
-                         f" → {escape(onemap.nice_name(to.get('name', '')))}{stops_txt} · {mins} min")
             if code:
+                parts = []
                 try:
-                    lines.append(f"     <i>Platform crowd now: {crowd_at(code, crowd_cache)}</i>")
+                    line = PCD_LINE.get(code[:2])
+                    if line not in crowd_cache:
+                        crowd_cache[line] = crowd_levels([line])
+                    parts.append(f"now {DOT.get(crowd_cache[line].get(code), '⚪')}")
                 except Exception:
                     pass
-                forecast = predictor.describe(code, leg_starts_at)
+                forecast = predictor.predict(code, starts_at)
                 if forecast:
-                    lines.append(f"     <i>🔮 When you get there (~{leg_starts_at:%H:%M}): usually {forecast}</i>")
-                    mrt_stops.append((code, (leg_starts_at - now).total_seconds() / 60))
+                    parts.append(f"🔮 {starts_at:%H:%M} {DOT[forecast[0]]}")
+                    mrt_stops.append((code, (starts_at - now).total_seconds() / 60))
+                if parts:
+                    lines.append("      <i>" + " · ".join(parts) + "</i>")
         else:
-            lines.append(f"{step}. {escape(str(mode).title())} to {escape(onemap.nice_name(to.get('name', '')))} ({mins} min)")
-        step += 1
+            lines.append(f"➡️ {escape(str(mode).title())} to {short_name(to.get('name', ''))}")
+    flush_walk()
 
     try:
         wait = predictor.best_departure(mrt_stops)
@@ -277,33 +274,19 @@ def trip_text(start, end, itineraries, index=0):
         print("Prediction error:", e)
         wait = None
     if wait:
-        leave_at = now + timedelta(minutes=wait)
-        lines.append(f"\n💡 <b>Tip:</b> the trains are usually busy right now. "
-                     f"Leaving at about <b>{leave_at:%H:%M}</b> ({wait} min later) should be quieter.")
+        lines.append(f"\n💡 Quieter if you leave at <b>{now + timedelta(minutes=wait):%H:%M}</b>")
 
-    others = [i for i in range(len(itineraries)) if i != index]
-    if others:
-        lines.append("\n<b>Other options</b> (tap a button below)")
-        for i in others:
-            it = itineraries[i]
-            lines.append(f"• Option {i + 1}: {round(it.get('duration', 0) / 60)} min – {escape(short_summary(it))}")
+    return "\n".join(lines) + disruption_text()
 
-    try:
-        lines.append("\n" + alert_text())
-    except Exception:
-        pass
-    lines.append("\n<i>🟢 seats  🟡 standing  🔴 packed  ·  🔮 = prediction from my model  ·  Routes by OneMap</i>")
-    return "\n".join(lines)
 
+# ---------- Trip planning conversation ----------
 
 ASK_FROM, ASK_TO = range(2)
-WHERE_FROM = ("📍 <b>Where are you starting from?</b>\n"
-              "Send a postal code, address or place name.\n"
-              "Or tap 📎 → <b>Location</b> to use where you are now.")
 
 
 async def go_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WHERE_FROM, parse_mode="HTML")
+    await update.message.reply_text("📍 <b>From where?</b>\nPostal code, address or place name.",
+                                    parse_mode="HTML", reply_markup=ASK_MENU)
     return ASK_FROM
 
 
@@ -311,7 +294,7 @@ async def find_place(update: Update):
     """Turns the user's message (text or shared location) into a place, or None."""
     if update.message.location:
         loc = update.message.location
-        return {"name": "Your location", "lat": loc.latitude, "lon": loc.longitude}
+        return {"name": "My location", "lat": loc.latitude, "lon": loc.longitude}
     text = (update.message.text or "").strip()
     try:
         place = await asyncio.to_thread(onemap.search, text)
@@ -319,7 +302,7 @@ async def find_place(update: Update):
         print("OneMap search error:", e)
         place = None
     if not place:
-        await update.message.reply_text(f"😕 I couldn't find “{text}”. Try a 6-digit postal code or a clearer name.")
+        await update.message.reply_text(f"😕 Couldn't find “{escape(text)}”. Try a postal code.", parse_mode="HTML")
     return place
 
 
@@ -328,18 +311,15 @@ async def go_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not place:
         return ASK_FROM
     context.user_data["start"] = place
-    await update.message.reply_text(
-        f"✅ From: <b>{escape(place['name'])}</b>\n\n🏁 <b>Where do you want to go?</b>", parse_mode="HTML")
+    await update.message.reply_text(f"From <b>{escape(place['name'])}</b>\n\n🏁 <b>To where?</b>",
+                                    parse_mode="HTML", reply_markup=ASK_MENU)
     return ASK_TO
 
 
 def option_buttons(itineraries, index):
-    rows = []
-    for i, it in enumerate(itineraries):
-        if i == index:
-            continue
-        label = f"Option {i + 1}: {round(it.get('duration', 0) / 60)} min · {short_summary(it)}"
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"opt:{i}")])
+    rows = [[InlineKeyboardButton(f"{round(it.get('duration', 0) / 60)} min · {short_summary(it)}"[:60],
+                                  callback_data=f"opt:{i}")]
+            for i, it in enumerate(itineraries) if i != index]
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -348,25 +328,21 @@ async def go_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not place:
         return ASK_TO
     start = context.user_data["start"]
-    # same place (or within ~300 m)? no need for public transport
     if abs(start["lat"] - place["lat"]) < 0.003 and abs(start["lon"] - place["lon"]) < 0.003:
-        await update.message.reply_text(
-            f"📍 <b>{escape(place['name'])}</b> is where you're starting from, or right next to it, "
-            "so there's no trip to plan. 🙂\n\n🏁 <b>Where do you want to go?</b> (or /cancel)",
-            parse_mode="HTML")
+        await update.message.reply_text("📍 That's where you're starting. 🙂\n\n🏁 <b>To where?</b>",
+                                        parse_mode="HTML", reply_markup=ASK_MENU)
         return ASK_TO
-    await update.message.reply_text(f"✅ To: <b>{escape(place['name'])}</b>\n🔎 Finding the best route…",
-                                    parse_mode="HTML")
+
+    await update.message.reply_text("🔎 Finding routes…", reply_markup=MAIN_MENU)
     try:
         itineraries = await asyncio.to_thread(onemap.plan_route, start, place)
     except Exception as e:
         print("OneMap route error:", e)
         itineraries = None
     if not itineraries:
-        await update.message.reply_text("😕 Sorry, I couldn't find a public transport route between those places.")
+        await update.message.reply_text("😕 No public transport route found between those places.")
         return ConversationHandler.END
 
-    # remember this trip so the option buttons work
     context.user_data["trip"] = {"start": start, "end": place, "itineraries": itineraries}
     text = await asyncio.to_thread(trip_text, start, place, itineraries, 0)
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=option_buttons(itineraries, 0))
@@ -374,36 +350,45 @@ async def go_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs when someone taps an 'Option N' button."""
+    """Runs when someone taps one of the other route options."""
     query = update.callback_query
     await query.answer()
     trip = context.user_data.get("trip")
     index = int(query.data.split(":")[1])
     if not trip or index >= len(trip["itineraries"]):
-        await query.message.reply_text("That trip has expired. Send /go to plan it again.")
+        await query.message.reply_text("That trip has expired. Tap 🗺️ Plan a trip again.")
         return
     text = await asyncio.to_thread(trip_text, trip["start"], trip["end"], trip["itineraries"], index)
-    await query.message.reply_text(text, parse_mode="HTML",
-                                   reply_markup=option_buttons(trip["itineraries"], index))
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=option_buttons(trip["itineraries"], index))
 
 
 async def go_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Trip planning cancelled. Send /go to plan another trip, or /help for all commands.")
+    """Cancel button, any command, or another menu button while planning a trip."""
+    text = (update.message.text or "").strip()
+    action = MENU_ACTIONS.get(text)
+    if text == BTN_TRIP:
+        return await go_start(update, context)    # start a fresh trip
+    if action:
+        await action(update, context)          # e.g. they tapped 🎒 To school mid-trip: just do that
+    else:
+        await update.message.reply_text("Cancelled.", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
 
+# ---------- Other commands ----------
+
 HELP = (
-    "👋 <b>SG Transit Bot</b>\n\n"
-    "/go – plan a trip from anywhere to anywhere 🗺️\n"
-    "/school – my bus + MRT crowd going to school\n"
-    "/home – MRT crowd + my bus going home\n"
-    "/mrt – crowd at my stations\n"
-    "/bus 44089 – live buses at any stop\n\n"
-    "Tip: you can also just send a 5-digit bus stop code."
+    "👋 <b>SG Transit Helper</b>\n"
+    "Use the buttons below, or:\n\n"
+    "🗺️ /go  plan a trip anywhere\n"
+    "🚌 /bus 44089  buses at any stop\n"
+    "     (or just send the 5-digit code)\n\n"
+    "<b>Symbols</b>\n"
+    "🟢 quiet / seats   🟡 busy / standing   🔴 packed\n"
+    "~ timetable estimate (no live GPS)\n"
+    "🔮 prediction from my model"
 )
 
-
-# ---------- Telegram commands ----------
 
 async def reply(update: Update, make_text):
     """Fetch data in the background (so the bot doesn't freeze), then reply."""
@@ -411,12 +396,12 @@ async def reply(update: Update, make_text):
         text = await asyncio.to_thread(make_text)
     except Exception as e:
         print("Error:", e)
-        text = "😕 Sorry, I couldn't get data from LTA right now. Try again in a moment."
-    await update.message.reply_text(text, parse_mode="HTML")
+        text = "😕 Couldn't reach LTA right now. Try again in a moment."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP, parse_mode="HTML")
+    await update.message.reply_text(HELP, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 async def school(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,8 +413,7 @@ async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mrt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stations = list(dict.fromkeys(TO_SCHOOL_STATIONS + GO_HOME_STATIONS))
-    await reply(update, lambda: mrt_text(stations) + "\n\n" + alert_text())
+    await reply(update, mrt_text)
 
 
 async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -437,30 +421,36 @@ async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Send it like this: /bus 44089")
         return
     stop = context.args[0]
-    await reply(update, lambda: bus_text(stop) + LEGEND)
+    await reply(update, lambda: bus_block(stop))
+
+
+MENU_ACTIONS = {BTN_SCHOOL: school, BTN_HOME: home, BTN_MRT: mrt, BTN_TRIP: go_start}
 
 
 async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
-    if msg.isdigit() and len(msg) == 5:
-        await reply(update, lambda: bus_text(msg) + LEGEND)
+    if msg in MENU_ACTIONS and msg != BTN_TRIP:
+        await MENU_ACTIONS[msg](update, context)
+    elif msg.isdigit() and len(msg) == 5:
+        await reply(update, lambda: bus_block(msg))
     else:
-        await update.message.reply_text(HELP, parse_mode="HTML")
+        await start(update, context)
 
 
 def main():
     if not BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN is missing from your .env file.")
+        print("TELEGRAM_BOT_TOKEN is missing.")
         return
     app = Application.builder().token(BOT_TOKEN).build()
-    place_input = (filters.TEXT & ~filters.COMMAND) | filters.LOCATION
+    menu_button = filters.Text(MENU_BUTTONS)
+    place_input = (filters.TEXT & ~filters.COMMAND & ~menu_button) | filters.LOCATION
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("go", go_start)],
+        entry_points=[CommandHandler("go", go_start), MessageHandler(filters.Text([BTN_TRIP]), go_start)],
         states={
             ASK_FROM: [MessageHandler(place_input, go_from)],
             ASK_TO: [MessageHandler(place_input, go_to)],
         },
-        fallbacks=[MessageHandler(filters.COMMAND, go_cancel)],   # /cancel or any other command stops the trip
+        fallbacks=[MessageHandler(filters.COMMAND | menu_button, go_cancel)],
     ))
     app.add_handler(CallbackQueryHandler(show_option, pattern=r"^opt:\d+$"))
     app.add_handler(CommandHandler(["start", "help"], start))
@@ -469,7 +459,7 @@ def main():
     app.add_handler(CommandHandler("mrt", mrt))
     app.add_handler(CommandHandler("bus", bus))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
-    print("Bot is running. Open Telegram and message your bot. Press Ctrl + C to stop.")
+    print("Bot is running. Press Ctrl + C to stop.")
     app.run_polling()
 
 

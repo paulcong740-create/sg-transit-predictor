@@ -2,3 +2,6 @@
 # If two saves happen at the same moment, keep the rows from both instead of stopping with a conflict.
 data/bus/*.csv merge=union
 data/mrt/*.csv merge=union
+
+# Shell scripts must keep Linux line endings or they fail on the server
+*.sh text eol=lf

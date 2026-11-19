@@ -3,3 +3,7 @@
 
 # Python cache files
 __pycache__/
+
+# Server-only files
+venv/
+*.log
