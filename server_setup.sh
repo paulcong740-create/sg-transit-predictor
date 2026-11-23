@@ -64,7 +64,7 @@ sudo systemctl enable --now transit-bot
 # Nightly update at 4:30 am Singapore time (20:30 UTC - the server's clock is in UTC)
 chmod +x nightly_update.sh
 ( crontab -l 2>/dev/null | grep -v nightly_update.sh ; \
-  echo "30 20 * * * $DIR/nightly_update.sh >> $DIR/nightly.log 2>&1" ) | crontab -
+  echo "30 20 * * * bash $DIR/nightly_update.sh >> $DIR/nightly.log 2>&1" ) | crontab -
 
 echo ""
 echo "✅ Done! The bot is running 24/7."
