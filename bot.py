@@ -1,6 +1,7 @@
 # bot.py
 # Telegram bot: plans trips anywhere in Singapore, with live bus times, MRT crowd levels
-# and crowd predictions from my own model.
+# and crowd predictions from my own model. Each user saves their own home and school,
+# so the 🎒 / 🏠 buttons work for everyone.
 #
 # Run it with:  python bot.py      (stop with Ctrl + C)
 
@@ -8,14 +9,14 @@ import asyncio
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from html import escape
+from html import escape, unescape
 
 import requests
 from dotenv import load_dotenv
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-                          ConversationHandler, MessageHandler, filters)
+                          ConversationHandler, MessageHandler, PicklePersistence, filters)
 
 import onemap
 import predictor
@@ -27,25 +28,20 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE = "https://datamall2.mytransport.sg/ltaodataservice"
 SG = timezone(timedelta(hours=8))
 
-# ---- MY ROUTE ----
-HOME_STOP, HOME_STOP_BUSES = "44089", {"991", "451"}      # board here going to school
-CCK_INT, CCK_INT_BUSES = "44009", {"172"}                 # Choa Chu Kang Int, going home
-TO_SCHOOL_STATIONS = ["NS3", "NS1", "EW22"]
-GO_HOME_STATIONS = ["EW22", "NS1", "NS4"]
-STATION_NAMES = {"NS3": "Bukit Gombak", "NS1": "Jurong East", "EW24": "Jurong East",
-                 "EW22": "Dover", "NS4": "Choa Chu Kang"}
-# ------------------
+# Each user's saved places live in this file on the server (it is in .gitignore - never upload it)
+DATA_FILE = "bot_data.pickle"
 
 DOT = {"l": "🟢", "m": "🟡", "h": "🔴"}                 # MRT crowd: low / moderate / high
 BUS_LOAD = {"SEA": "🟢", "SDA": "🟡", "LSD": "🔴"}       # bus: seats / standing / packed
 
 # ---- the buttons under the chat box ----
 BTN_SCHOOL, BTN_HOME, BTN_TRIP, BTN_MRT = "🎒 To school", "🏠 Go home", "🗺️ Plan a trip", "🚇 MRT crowds"
-BTN_CANCEL = "✖️ Cancel"
-MAIN_MENU = ReplyKeyboardMarkup([[BTN_SCHOOL, BTN_HOME], [BTN_TRIP, BTN_MRT]], resize_keyboard=True)
+BTN_PLACES, BTN_CANCEL = "⚙️ My places", "✖️ Cancel"
+MAIN_MENU = ReplyKeyboardMarkup([[BTN_SCHOOL, BTN_HOME], [BTN_TRIP, BTN_MRT], [BTN_PLACES]],
+                                resize_keyboard=True)
 ASK_MENU = ReplyKeyboardMarkup([[KeyboardButton("📍 Use my location", request_location=True)], [BTN_CANCEL]],
                                resize_keyboard=True)
-MENU_BUTTONS = [BTN_SCHOOL, BTN_HOME, BTN_TRIP, BTN_MRT, BTN_CANCEL]
+MENU_BUTTONS = [BTN_SCHOOL, BTN_HOME, BTN_TRIP, BTN_MRT, BTN_PLACES, BTN_CANCEL]
 
 
 # ---------- Getting data from LTA ----------
@@ -111,7 +107,7 @@ def disruption_text():
     return "\n".join(lines)
 
 
-# ---------- My commute ----------
+# ---------- Bus stop and MRT blocks ----------
 
 def bus_block(stop, only=None):
     services = lta_get("v3/BusArrival", {"BusStopCode": stop})["Services"]
@@ -124,34 +120,21 @@ def bus_block(stop, only=None):
     return "\n".join(lines)
 
 
-def mrt_block(stations):
-    levels = crowd_levels({"NSL" if c.startswith("NS") else "EWL" for c in stations})
-    in_30 = datetime.now(SG) + timedelta(minutes=30)
-    lines = ["🚇 <b>Platforms</b>  <i>now → 🔮 in 30 min</i>"]
-    for code in stations:
-        now_dot = DOT.get(levels.get(code), "⚪")
-        forecast = predictor.predict(code, in_30)
-        later = f" → {DOT[forecast[0]]}" if forecast else ""
-        lines.append(f"{now_dot}{later}  {STATION_NAMES.get(code, code)}")
-    return "\n".join(lines)
-
-
 def header(title):
     return f"{title}  <i>{datetime.now(SG):%H:%M}</i>"
 
 
-def school_text():
-    return "\n\n".join([header("🎒 <b>To school</b>"), bus_block(HOME_STOP, HOME_STOP_BUSES),
-                        mrt_block(TO_SCHOOL_STATIONS)]) + disruption_text()
-
-
-def home_text():
-    return "\n\n".join([header("🏠 <b>Going home</b>"), mrt_block(GO_HOME_STATIONS),
-                        bus_block(CCK_INT, CCK_INT_BUSES)]) + disruption_text()
-
-
-def mrt_text():
-    return header("🚇 <b>MRT crowds</b>") + "\n\n" + mrt_block(["NS4", "NS3", "NS1", "EW22"]) + disruption_text()
+def mrt_text(stations):
+    """stations: list of (code, name) on this user's commute."""
+    lines_needed = {PCD_LINE.get(code[:2]) for code, _ in stations} - {None}
+    levels = crowd_levels(lines_needed)
+    in_30 = datetime.now(SG) + timedelta(minutes=30)
+    lines = [header("🚇 <b>MRT crowds</b>"), "", "<i>now → 🔮 in 30 min</i>"]
+    for code, name in stations:
+        forecast = predictor.predict(code, in_30)
+        later = f" → {DOT[forecast[0]]}" if forecast else ""
+        lines.append(f"{DOT.get(levels.get(code), '⚪')}{later}  {escape(name)}")
+    return "\n".join(lines) + disruption_text()
 
 
 # ---------- Journey planner (any place to any place) ----------
@@ -182,6 +165,19 @@ def short_name(name):
 def line_of(leg):
     code = station_code(leg.get("from", {}))
     return LINE_LABEL.get(PCD_LINE.get(code[:2]), "MRT") if code else "MRT"
+
+
+def route_stations(itinerary):
+    """Every MRT/LRT station where this route boards or changes trains: [(code, name), ...]"""
+    found = {}
+    for leg in itinerary.get("legs", []):
+        if leg.get("mode") in ("SUBWAY", "RAIL", "TRAM"):
+            for end in (leg.get("from", {}), leg.get("to", {})):
+                code = station_code(end)
+                name = unescape(short_name(end.get("name", code)))
+                if code and code not in found and name not in found.values():   # interchange: list once
+                    found[code] = name
+    return list(found.items())
 
 
 def short_summary(itinerary):
@@ -281,7 +277,7 @@ def trip_text(start, end, itineraries, index=0):
 
 # ---------- Trip planning conversation ----------
 
-ASK_FROM, ASK_TO = range(2)
+ASK_FROM, ASK_TO, SET_HOME, SET_SCHOOL = range(4)
 
 
 async def go_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,14 +358,98 @@ async def show_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=option_buttons(trip["itineraries"], index))
 
 
+# ---------- Each user's own home and school ----------
+
+def saved(place):
+    """Keep only what we need: a short name and the coordinates (no postal code is stored)."""
+    return {"name": place["name"], "lat": place["lat"], "lon": place["lon"]}
+
+
+async def places_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🏠 <b>Where's home?</b>\nSend your postal code, an address, or tap 📍 to use where you are now.\n\n"
+        "<i>Saved only for you, so 🎒 To school and 🏠 Go home work. /forget deletes it.</i>",
+        parse_mode="HTML", reply_markup=ASK_MENU)
+    return SET_HOME
+
+
+async def set_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    place = await find_place(update)
+    if not place:
+        return SET_HOME
+    context.user_data["home"] = saved(place)
+    await update.message.reply_text(f"✅ Home: <b>{escape(place['name'])}</b>\n\n"
+                                    "🏫 <b>Where's school (or work)?</b>\nPostal code, address or place name.",
+                                    parse_mode="HTML", reply_markup=ASK_MENU)
+    return SET_SCHOOL
+
+
+async def set_school(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    place = await find_place(update)
+    if not place:
+        return SET_SCHOOL
+    home = context.user_data["home"]
+    if abs(home["lat"] - place["lat"]) < 0.003 and abs(home["lon"] - place["lon"]) < 0.003:
+        await update.message.reply_text("📍 That's the same as home. 🙂 Where's school (or work)?")
+        return SET_SCHOOL
+    context.user_data["school"] = saved(place)
+    context.user_data.pop("commute_stations", None)       # their route changed
+    await update.message.reply_text(
+        f"✅ School: <b>{escape(place['name'])}</b>\n\nAll set! Change them any time with {BTN_PLACES}.",
+        parse_mode="HTML", reply_markup=MAIN_MENU)
+    pending = context.user_data.pop("pending", None)      # the button they tapped before setting up
+    if pending:
+        await run_commute(update, context, pending)
+    return ConversationHandler.END
+
+
+def plan_commute(user_data, direction):
+    """Plan home → school (or back) with live data. Returns (text, itineraries) or (text, None)."""
+    home = {**user_data["home"], "name": "🏠 Home"}
+    school = {**user_data["school"], "name": "🏫 School"}
+    start, end = (home, school) if direction == "school" else (school, home)
+    itineraries = onemap.plan_route(start, end)
+    if not itineraries:
+        return "😕 No public transport route found between your home and school.", None
+    user_data["commute_stations"] = route_stations(itineraries[0]) or user_data.get("commute_stations")
+    user_data["trip"] = {"start": start, "end": end, "itineraries": itineraries}
+    return trip_text(start, end, itineraries, 0), itineraries
+
+
+async def run_commute(update: Update, context: ContextTypes.DEFAULT_TYPE, direction):
+    try:
+        text, itineraries = await asyncio.to_thread(plan_commute, context.user_data, direction)
+    except Exception as e:
+        print("Commute error:", e)
+        text, itineraries = "😕 Couldn't plan that right now. Try again in a moment.", None
+    buttons = option_buttons(itineraries, 0) if itineraries else None
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=buttons or MAIN_MENU)
+
+
+async def commute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎒 To school / 🏠 Go home. First time: ask for their places, then plan."""
+    direction = "school" if update.message.text.strip() in (BTN_SCHOOL, "/school") else "home"
+    if not (context.user_data.get("home") and context.user_data.get("school")):
+        context.user_data["pending"] = direction
+        await update.message.reply_text("First, let's save your home and school. It only takes a moment. 👇")
+        return await places_start(update, context)
+    await update.message.reply_text("🔎 Checking your route…", reply_markup=MAIN_MENU)
+    await run_commute(update, context, direction)
+    return ConversationHandler.END
+
+
+async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for key in ("home", "school", "commute_stations", "trip", "start", "pending"):
+        context.user_data.pop(key, None)
+    await update.message.reply_text("🗑️ Done. I've deleted your saved home and school.", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
+
 async def go_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel button, any command, or another menu button while planning a trip."""
-    text = (update.message.text or "").strip()
-    action = MENU_ACTIONS.get(text)
-    if text == BTN_TRIP:
-        return await go_start(update, context)    # start a fresh trip
-    if action:
-        await action(update, context)          # e.g. they tapped 🎒 To school mid-trip: just do that
+    """Cancel button or any other command while planning a trip or saving places."""
+    context.user_data.pop("pending", None)
+    if (update.message.text or "").strip().startswith(("/start", "/help")):
+        await start(update, context)
     else:
         await update.message.reply_text("Cancelled.", reply_markup=MAIN_MENU)
     return ConversationHandler.END
@@ -379,10 +459,14 @@ async def go_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP = (
     "👋 <b>SG Transit Helper</b>\n"
-    "Use the buttons below, or:\n\n"
+    "Plans your trip with live bus times, MRT crowds and crowd predictions.\n\n"
+    "🎒 / 🏠  your trip between home and school\n"
     "🗺️ /go  plan a trip anywhere\n"
+    "🚇  crowds at the stations on your route\n"
+    "⚙️ /places  set or change home and school\n"
     "🚌 /bus 44089  buses at any stop\n"
-    "     (or just send the 5-digit code)\n\n"
+    "     (or just send the 5-digit code)\n"
+    "🗑️ /forget  delete your saved places\n\n"
     "<b>Symbols</b>\n"
     "🟢 quiet / seats   🟡 busy / standing   🔴 packed\n"
     "~ timetable estimate (no live GPS)\n"
@@ -404,16 +488,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
-async def school(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply(update, school_text)
-
-
-async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply(update, home_text)
-
-
 async def mrt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply(update, mrt_text)
+    stations = context.user_data.get("commute_stations")
+    if not stations:
+        has_places = context.user_data.get("home") and context.user_data.get("school")
+        msg = (f"Tap {BTN_SCHOOL} once first, so I know which stations are on your route." if has_places
+               else f"Save your home and school first ({BTN_PLACES}), then I'll show crowds on your route.")
+        await update.message.reply_text(msg, reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    await reply(update, lambda: mrt_text(stations))
+    return ConversationHandler.END
 
 
 async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,13 +508,10 @@ async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, lambda: bus_block(stop))
 
 
-MENU_ACTIONS = {BTN_SCHOOL: school, BTN_HOME: home, BTN_MRT: mrt, BTN_TRIP: go_start}
-
-
 async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
-    if msg in MENU_ACTIONS and msg != BTN_TRIP:
-        await MENU_ACTIONS[msg](update, context)
+    if msg == BTN_CANCEL:
+        await update.message.reply_text("OK.", reply_markup=MAIN_MENU)
     elif msg.isdigit() and len(msg) == 5:
         await reply(update, lambda: bus_block(msg))
     else:
@@ -441,22 +522,29 @@ def main():
     if not BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN is missing.")
         return
-    app = Application.builder().token(BOT_TOKEN).build()
+    # PicklePersistence saves each user's places to DATA_FILE, so they survive restarts
+    app = Application.builder().token(BOT_TOKEN).persistence(PicklePersistence(filepath=DATA_FILE)).build()
     menu_button = filters.Text(MENU_BUTTONS)
     place_input = (filters.TEXT & ~filters.COMMAND & ~menu_button) | filters.LOCATION
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("go", go_start), MessageHandler(filters.Text([BTN_TRIP]), go_start)],
+        entry_points=[
+            CommandHandler("go", go_start), MessageHandler(filters.Text([BTN_TRIP]), go_start),
+            CommandHandler(["school", "home"], commute), MessageHandler(filters.Text([BTN_SCHOOL, BTN_HOME]), commute),
+            CommandHandler("places", places_start), MessageHandler(filters.Text([BTN_PLACES]), places_start),
+            CommandHandler("mrt", mrt), MessageHandler(filters.Text([BTN_MRT]), mrt),
+            CommandHandler("forget", forget),
+        ],
         states={
             ASK_FROM: [MessageHandler(place_input, go_from)],
             ASK_TO: [MessageHandler(place_input, go_to)],
+            SET_HOME: [MessageHandler(place_input, set_home)],
+            SET_SCHOOL: [MessageHandler(place_input, set_school)],
         },
-        fallbacks=[MessageHandler(filters.COMMAND | menu_button, go_cancel)],
+        fallbacks=[MessageHandler(filters.COMMAND | filters.Text([BTN_CANCEL]), go_cancel)],
+        allow_reentry=True,          # tapping another menu button mid-way just starts that instead
     ))
     app.add_handler(CallbackQueryHandler(show_option, pattern=r"^opt:\d+$"))
     app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("school", school))
-    app.add_handler(CommandHandler("home", home))
-    app.add_handler(CommandHandler("mrt", mrt))
     app.add_handler(CommandHandler("bus", bus))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
     print("Bot is running. Press Ctrl + C to stop.")

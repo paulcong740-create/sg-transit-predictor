@@ -7,3 +7,6 @@ __pycache__/
 # Server-only files
 venv/
 *.log
+
+# Users' saved places (private - never upload)
+bot_data.pickle
